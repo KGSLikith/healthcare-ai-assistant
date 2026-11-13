@@ -1,1 +1,19 @@
+
+# Environment variables and secrets
 .env
+.env.*
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Backups
+app_backup/
+backup_*.sql
+*.db
+
+# Virtual environments
+venv/
+env/

@@ -72,7 +72,7 @@ get_email_service = email_service_mod.get_email_service
 load_dotenv()
 st.set_page_config(page_title="Health AI Assistant", page_icon="🥼", layout="wide")
 
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 groq_client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 if not groq_client:

@@ -92,10 +92,21 @@ You: [PROVIDE FULL RECOMMENDATIONS IMMEDIATELY]"""
 - చైతన్యం"""
 
     def _sys_prompt(self) -> str:
-        return self.SYSTEM_PROMPT_TE if self.lang == "te" else self.SYSTEM_PROMPT_EN
+        base = self.SYSTEM_PROMPT_TE if self.lang == "te" else self.SYSTEM_PROMPT_EN
+        safety = (
+            "\n\nSAFETY RULES:\n"
+            "- Never diagnose the user. If asked for a diagnosis, say you cannot diagnose and recommend a medical professional.\n"
+            "- Do not provide exact prescription dosages or medical treatment plans.\n"
+            "- Always keep responses short and ask only one simple question at a time while gathering information.\n"
+            "- Use friendly, conversational language.\n"
+            "- If the user shares a mood or says they feel happy/sad, acknowledge it and politely ask if they have any health concerns or symptoms.\n"
+            "- When giving recommendations, clearly state this is educational guidance and not a diagnosis.\n"
+            "- Do not make definitive statements such as 'you have' or 'you will'.\n"
+        )
+        return base + safety
 
-    def _chat(self, messages: List[Dict[str, str]], max_tokens: int = 150) -> str:
-        """Call Groq API"""
+    def _chat(self, messages: List[Dict[str, str]], max_tokens: int = 150, expect_question: bool = False) -> str:
+        """Call Groq API and enforce response guardrails"""
         try:
             resp = self.groq_client.chat.completions.create(
                 model=self.model,
@@ -103,10 +114,70 @@ You: [PROVIDE FULL RECOMMENDATIONS IMMEDIATELY]"""
                 temperature=0.2,
                 max_tokens=max_tokens,
             )
-            return resp.choices[0].message.content.strip()
+            raw_response = resp.choices[0].message.content.strip()
+            return self._validate_assistant_response(raw_response, expect_question=expect_question)
         except Exception as e:
             print(f"Chat API error: {e}")
             return "I'm having trouble processing. Please try again."
+
+    def _validate_assistant_response(self, response: str, expect_question: bool = False) -> str:
+        """Ensure the model response follows guardrails."""
+        text = (response or "").strip()
+        if not text:
+            if expect_question:
+                return "Can you tell me more about your symptoms in one short sentence?"
+            return "I'm sorry, I couldn't generate a response. Please try again."
+
+        normalized = re.sub(r"\s+", " ", text).strip()
+        lower = normalized.lower()
+
+        if expect_question:
+            # Force a question when gathering information.
+            if "?" not in normalized or normalized.count("?") > 1:
+                return "Can you tell me more about your symptoms in one short question?"
+            if len(normalized.splitlines()) > 4 or len(normalized) > 220:
+                return "Please answer briefly and tell me one symptom or concern."
+
+        # Safety guard: disallow diagnostic certainty or prescription claims.
+        if re.search(r"\b(i can diagnose|i cannot diagnose|i can't diagnose|you have|you will|definitely|certainly|surely)\b", lower):
+            if expect_question:
+                return "I cannot diagnose your condition. Can you describe any additional symptoms?"
+
+        # Add a strong disclaimer for recommendation responses.
+        if not expect_question and not re.search(r"\b(medical diagnosis|educational guidance|not a diagnosis|consult .* doctor|consult .* medical professional)\b", lower):
+            normalized += "\n\nNote: This is educational guidance, not a medical diagnosis. Consult a healthcare professional for serious symptoms."
+
+        return normalized
+
+    def _is_mood_only_text(self, text: str) -> bool:
+        """Detect non-health mood/status messages and avoid treating them as symptoms."""
+        normalized = (text or "").strip().lower()
+        if not normalized:
+            return False
+
+        mood_phrases = [
+            "i am happy", "i'm happy", "i feel happy", "feeling happy",
+            "i am good", "i'm good", "i feel good", "feeling good",
+            "i am okay", "i'm okay", "i feel okay", "feeling okay",
+            "i am fine", "i'm fine", "i feel fine", "feeling fine",
+            "i am well", "i'm well", "i feel well", "feeling well",
+            "i am sad", "i'm sad", "i feel sad", "feeling sad",
+            "i am great", "i'm great", "feeling great"
+        ]
+        health_keywords = [
+            "pain", "fever", "cough", "headache", "nausea", "vomit", "dizzy",
+            "symptom", "hurt", "ache", "infection", "cold", "flu", "injury",
+            "anxiety", "depression", "stress", "sore", "stomach", "diarrhea",
+            "blood", "rash", "allergy", "breath", "chest", "vomiting"
+        ]
+        health_phrases = [
+            "no cough", "no fever", "no pain", "not feeling well", "not well"
+        ]
+
+        if any(phrase in normalized for phrase in mood_phrases):
+            if not any(keyword in normalized for keyword in health_keywords) and not any(phrase in normalized for phrase in health_phrases):
+                return True
+        return False
 
     def _extract_health_data(self) -> Dict:
         """Extract health data with proper error handling"""
@@ -437,6 +508,16 @@ Make everything HIGHLY SPECIFIC to {condition}."""
         """Process message - ONE question at a time, auto-generate when done"""
         self.conversation_history.append({"role": "user", "content": text})
         self.questions_asked += 1
+
+        if self._is_mood_only_text(text):
+            response = (
+                "I'm glad you're feeling happy! "
+                "If you'd like to discuss your health, I'm here to help anytime."
+            )
+            self.conversation_history.append({"role": "assistant", "content": response})
+            return response
+
+        self.questions_asked += 1
         
         # Check if user is done
         user_is_done = self._detect_completion_keywords(text)
@@ -465,7 +546,7 @@ Make everything HIGHLY SPECIFIC to {condition}."""
             recent_history = self.conversation_history[-10:]
             messages.extend(recent_history)
             
-            response = self._chat(messages)
+            response = self._chat(messages, expect_question=True)
         
         self.conversation_history.append({"role": "assistant", "content": response})
         return response
@@ -502,15 +583,28 @@ Make everything HIGHLY SPECIFIC to {condition}."""
     def _detect_completion_keywords(self, text: str) -> bool:
         """Detect if user is done"""
         text_lower = text.lower().strip()
-        
-        en_keywords = ["no", "nope", "nothing", "nothing else", "that's all", 
-                       "nah", "no more", "thats all", "thats it", "done"]
-        te_keywords = ["లేదు", "కాదు", "అంతే", "చాలు", "మరేమీ లేదు"]
-        
-        for kw in en_keywords + te_keywords:
-            if text_lower == kw or (len(kw) > 2 and kw in text_lower):
-                return True
-        
+        if not text_lower:
+            return False
+
+        exact_done = {
+            "no", "nope", "nah", "done",
+            "nothing", "nothing else", "nothing more",
+            "that's all", "thats all", "that's it", "thats it",
+            "అంతே", "మరేమీ లేదు"
+        }
+
+        if text_lower in exact_done:
+            return True
+
+        # Allow common completion phrases even when user adds punctuation or extra words.
+        if re.search(r"\b(nothing else|nothing more|that's all|thats all|that's it|thats it|మరేమీ లేదు|అంతే)\b", text_lower):
+            return True
+
+        # Allow short affirmative completion responses like "no, that's all" but avoid matching
+        # partial facts such as "I have no cough" or "no fever yet".
+        if re.fullmatch(r"(no|nope|nah|done)[,\.\s]*(that's all|thats all|that's it|thats it|nothing else|nothing more)?", text_lower):
+            return True
+
         return False
 
     def summarize_session(self, messages_from_db: List[Dict]) -> str:
